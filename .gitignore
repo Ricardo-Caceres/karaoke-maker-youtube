@@ -1,0 +1,23 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.venv/
+spleeter_env/
+venv/
+ENV/
+
+# Project specific directories
+downloads/
+temp/
+output/
+pretrained_models/
+logs/
+
+# macOS system files
+.DS_Store
+
+# Local configuration
+.env

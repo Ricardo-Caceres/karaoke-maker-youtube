@@ -1,0 +1,6 @@
+yt-dlp
+spleeter
+moviepy
+stable-whisper
+librosa
+soundfile
