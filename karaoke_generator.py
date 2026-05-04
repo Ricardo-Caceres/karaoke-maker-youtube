@@ -1,8 +1,14 @@
 import os
 import sys
 import subprocess
+import re
 import torch
 import argparse
+import stable_whisper
+import lyricsgenius
+from audio_separator.separator import Separator
+from dotenv import load_dotenv
+from PIL import ImageFont
 
 # Evitar error de duplicado de libiomp5
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -11,11 +17,6 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 venv_site_packages = os.path.join(os.getcwd(), "spleeter_env", "lib", "python3.9", "site-packages")
 if os.path.exists(venv_site_packages):
     sys.path.insert(0, venv_site_packages)
-
-import stable_whisper
-import lyricsgenius
-from audio_separator.separator import Separator
-from dotenv import load_dotenv
 
 # Cargar variables de entorno desde .env
 load_dotenv()
@@ -26,6 +27,151 @@ VOCAL_MODEL = "UVR-MDX-NET-Voc_FT.onnx"
 DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 GENIUS_TOKEN = os.getenv("GENIUS_TOKEN")
 # ---------------------
+
+def get_text_width(text, size=48):
+    if not text: return 0
+    # Intentar rutas comunes de Arial en macOS
+    paths = [
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "/Library/Fonts/Microsoft/Arial.ttf",
+        "Arial.ttf"
+    ]
+    font = None
+    for p in paths:
+        try:
+            font = ImageFont.truetype(p, size)
+            break
+        except:
+            continue
+    
+    try:
+        if font:
+            if hasattr(font, 'getlength'):
+                return font.getlength(text)
+            else:
+                return font.getbbox(text)[2]
+        else:
+            # Fallback proporcional si no hay fuente: ~0.5 del tamaño por carácter
+            return len(text) * (size * 0.52)
+    except:
+        return len(text) * (size * 0.5)
+
+LETTER_PATTERN = re.compile(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]")
+STRONG_VOWELS = set("aáeéoó")
+ALLOWED_CONSONANT_ONSETS = {
+    "bl", "br", "cl", "cr", "dr", "fl", "fr",
+    "gl", "gr", "pl", "pr", "tr", "tl", "ch", "ll", "rr"
+}
+
+def _is_vowel(char):
+    return char.lower() in "aeiouáéíóúü"
+
+def _split_vowel_group(vowel_group):
+    if not vowel_group:
+        return []
+    pieces = [vowel_group[0]]
+    for char in vowel_group[1:]:
+        prev = pieces[-1][-1]
+        prev_l = prev.lower()
+        char_l = char.lower()
+        is_hiatus = (
+            prev_l in ("í", "ú") or
+            char_l in ("í", "ú") or
+            (prev_l in STRONG_VOWELS and char_l in STRONG_VOWELS)
+        )
+        if is_hiatus:
+            pieces.append(char)
+        else:
+            pieces[-1] += char
+    return pieces
+
+def _consonant_split_index(cluster):
+    n = len(cluster)
+    if n <= 1:
+        return 0
+    cluster_l = cluster.lower()
+    if n == 2:
+        return 0 if cluster_l in ALLOWED_CONSONANT_ONSETS else 1
+    if n == 3:
+        return 1 if cluster_l[1:] in ALLOWED_CONSONANT_ONSETS else 2
+    return (n - 2) if cluster_l[-2:] in ALLOWED_CONSONANT_ONSETS else (n - 1)
+
+def split_spanish_syllables(word):
+    if not word:
+        return []
+    if not any(_is_vowel(c) for c in word):
+        return [word]
+
+    syllables = []
+    i = 0
+    while i < len(word):
+        onset_start = i
+        while i < len(word) and not _is_vowel(word[i]):
+            i += 1
+
+        if i >= len(word):
+            if syllables:
+                syllables[-1] += word[onset_start:]
+            else:
+                syllables.append(word[onset_start:])
+            break
+
+        vowel_start = i
+        while i < len(word) and _is_vowel(word[i]):
+            i += 1
+        vowel_group = word[vowel_start:i]
+        nuclei = _split_vowel_group(vowel_group)
+
+        current = word[onset_start:vowel_start] + nuclei[0]
+        for nucleus in nuclei[1:]:
+            syllables.append(current)
+            current = nucleus
+
+        cons_start = i
+        while i < len(word) and not _is_vowel(word[i]):
+            i += 1
+        consonants = word[cons_start:i]
+
+        if i >= len(word):
+            current += consonants
+            syllables.append(current)
+            break
+
+        split_idx = _consonant_split_index(consonants)
+        current += consonants[:split_idx]
+        syllables.append(current)
+        i = cons_start + split_idx
+
+    return [s for s in syllables if s]
+
+def split_token_into_syllables(token):
+    if not token:
+        return []
+
+    spans = list(re.finditer(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", token))
+    if not spans:
+        return [token]
+
+    chunks = []
+    cursor = 0
+    for match in spans:
+        prefix = token[cursor:match.start()]
+        core_word = match.group(0)
+        syllables = split_spanish_syllables(core_word) or [core_word]
+        if prefix:
+            syllables[0] = prefix + syllables[0]
+        chunks.extend(syllables)
+        cursor = match.end()
+
+    if cursor < len(token):
+        suffix = token[cursor:]
+        if chunks:
+            chunks[-1] += suffix
+        else:
+            chunks.append(suffix)
+
+    return [chunk for chunk in chunks if chunk]
 
 def find_yt_dlp():
     """Find the best yt-dlp executable available."""
@@ -43,13 +189,11 @@ def get_safe_title(youtube_url):
         command = [yt_dlp_cmd, "--get-title", "--no-playlist", youtube_url]
         result = subprocess.run(command, capture_output=True, text=True, check=True)
         raw_title = result.stdout.strip()
-        # Limpieza básica para nombres de archivo
         return "".join([c for c in raw_title if c.isalnum() or c in (" ", "-", "_")]).strip(), raw_title
     except:
         return "karaoke_song", "karaoke_song"
 
 def fetch_lyrics_from_genius(song_title_raw):
-    """Intenta descargar la letra de Genius para Alineación Forzada (100% Precisión)."""
     if not GENIUS_TOKEN:
         print("  [Genius] No Token found. Skipping Auto-Lyrics.")
         return None
@@ -57,19 +201,14 @@ def fetch_lyrics_from_genius(song_title_raw):
     try:
         print(f"  [Genius] Searching for: {song_title_raw}...")
         genius = lyricsgenius.Genius(GENIUS_TOKEN, verbose=False, remove_section_headers=True)
-        # Limpiamos el título quitando cosas como "(Official Video)", "HD", etc.
         clean_title = song_title_raw.split("(")[0].split("[")[0].strip()
         song = genius.search_song(clean_title)
         
         if song:
             print(f"  [Genius] Match found: {song.title} by {song.artist}")
-            # Limpieza profunda de la letra
             lyrics = song.lyrics
-            # Genius a veces añade cosas raras al inicio o final de la letra, quitamos el header de "Lyrics"
             if "Lyrics" in lyrics:
                 lyrics = lyrics.split("Lyrics", 1)[1]
-            # Quitar números al final de la letra (indicadores de contribución de Genius)
-            import re
             lyrics = re.sub(r"\d+Embed$", "", lyrics).strip()
             return lyrics
         else:
@@ -97,8 +236,8 @@ def download_media(url, audio_path, video_path, quality_height=720):
         except subprocess.CalledProcessError:
             print(f"\n[!] CRITICAL ERROR: yt-dlp failed completely.")
             raise e
-
-    v_format = f"bestvideo[height>={quality_height}][ext=mp4]/bestvideo[ext=mp4]/best[ext=mp4]"
+    
+    v_format = f"bestvideo[height<={quality_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={quality_height}][ext=mp4]"
     try:
         subprocess.run([yt_dlp_cmd, "--no-playlist", "-f", v_format, "-o", video_path, url], check=True)
     except subprocess.CalledProcessError as e:
@@ -110,12 +249,16 @@ def download_media(url, audio_path, video_path, quality_height=720):
             raise e
 
 def separate_lead_vocals(audio_path, inst_path, voc_path, output_dir):
-    """Mantenemos esta lógica intacta ya que la separación es perfecta."""
     if os.path.exists(inst_path) and os.path.exists(voc_path):
         print(">> Audio already separated.")
         return
-    print(f"Separating Lead Vocals with MDX-Net (Ultra-Quality)...")
-    separator = Separator(output_dir=output_dir, output_format="wav")
+    
+    print(f"Separating VOCALS with High-Fidelity Model ({VOCAL_MODEL})...")
+    separator = Separator(
+        output_dir=output_dir,
+        model_file_dir=os.path.join(os.getcwd(), "pretrained_models"),
+        output_format="WAV"
+    )
     separator.load_model(VOCAL_MODEL)
     output_files = separator.separate(audio_path)
     os.rename(os.path.join(output_dir, output_files[0]), inst_path)
@@ -128,52 +271,26 @@ def format_timestamp(seconds):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 def generate_ultra_precise_karaoke(audio_path, vocals_path, output_ass, safe_title, lyrics_content=None):
-    """Generates lyrics with cinematic scroll effect and high sensitivity."""
-    print(f"Transcribing LEAD VOCALS on {DEVICE.upper()} (STABLE-MODE)...")
-    
-    # Volvemos al motor original para evitar crashes en este entorno
+    """Generates lyrics with fixed lines at the bottom and a bouncing ball."""
+    print(f"Transcribing LEAD VOCALS on {DEVICE.upper()} (BOUNCING BALL PRO MODE)...")
     model = stable_whisper.load_model(WHISPER_MODEL, device=DEVICE)
-    
-    # Prompt Maestro: Instrucciones precisas para evitar omisiones
-    master_prompt = (
-        f"Transcripción literal para karaoke de la canción: {safe_title}. "
-        "No omitas ninguna palabra, incluso si son susurros, gritos o repeticiones. "
-        "Escribe cada sílaba que escuches. El idioma es español. "
-        "Formato poético, sin etiquetas de tiempo en el texto."
-    )
     
     if lyrics_content:
         print("  [Option 3] Forced Alignment mode ACTIVE (Using Genius/Text Lyrics).")
-        # Alineación Forzada: Tenemos la letra, solo buscamos los tiempos
         result = model.align(vocals_path, lyrics_content, language='es')
     else:
         print("  [Option 1] High-Sensitivity Transcription with Stable-Whisper...")
-        result = model.transcribe(
-            vocals_path, 
-            fp16=False,
-            language='es', 
-            initial_prompt=master_prompt,
-            beam_size=5,
-            best_of=5,
-            suppress_silence=False,
-            vad=True,
-            regroup=True
-        )
-    
+        result = model.transcribe(vocals_path, language='es', regroup=True)
+
     print("  [Refining] Phoneme-level synchronization...")
     model.refine(vocals_path, result)
     
-    print("  Regrouping for cinematic flow...")
     result.regroup('sl')
-    # Separar si hay un silencio de más de 0.4s
     result.split_by_gap(0.4)
-    # Separar por puntuación fuerte
     result.split_by_punctuation([",", ".", "?", "!", ";", ":", "..."])
     
-    # NUEVO: Forzamos el corte si la línea es muy larga (máximo 6 palabras)
-    # Esto evita el amontonamiento que viste en el screenshot
     try:
-        result.split_by_length(max_words=6)
+        result.split_by_length(max_words=5) 
     except:
         pass
         
@@ -193,65 +310,108 @@ ScaledBorderAndShadow: yes
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Arial,42,&H00FF0000,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,1,5,30,30,60,1
-Style: Active,Arial,48,&H00FF0000,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,1,5,30,30,60,1
+Style: Default,Arial,42,&H00FF0000,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,1,2,30,30,60,1
+Style: Active,Arial,48,&H00FF0000,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,4,1,2,30,30,60,1
+Style: Ball,Arial,40,&H0000FFFF,&H0000FFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,2,1,2,0,0,0,1
 """
     with open(output_ass, 'w', encoding='utf-8') as f:
         f.write(header + "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n")
         
-        # Reagrupamiento ultra-agresivo para evitar amontonamiento
-        result.regroup('sl')
-        result.split_by_gap(0.3) # Casi cualquier pausa crea nueva línea
-        result.split_by_punctuation([",", ".", "?", "!", ";", ":", "..."])
-        
-        try:
-            result.split_by_length(max_words=5) # Máximo 5 palabras por línea para claridad total
-        except:
-            pass
-            
-        result.remove_no_word_segments()
-        result.segments = [s for s in result.segments if (s.end - s.start) > 0.1]
-        
-        segments = result.segments
-        if not segments: 
-            print("  [!] Error: No se detectaron segmentos de voz.")
-            return False
-
         for i, seg in enumerate(segments):
             s_start, s_end = seg.start, seg.end
+            y_pos = 660 if (i % 2 == 0) else 600
             
-            # Anticipación de 4 segundos
-            v_start = max(0, s_start - 4.0)
-            v_end = s_end + 1.2
+            v_start = max(0, s_start - 1.5)
+            if i > 0:
+                v_start = max(v_start, segments[i-1].end)
+            v_end = s_end + 1.0
             
-            # Sincronización del resaltado
             wait_offset = int((s_start - v_start) * 100)
             k_text = f"{{\\k{wait_offset}}}"
             
+            cumulative_text = ""
+            syllable_data = []
+            
             for word in seg.words:
-                chars = list(word.word)
-                if not chars: continue
-                total_word_dur = int((word.end - word.start) * 100)
-                char_dur = total_word_dur // len(chars)
-                remainder = total_word_dur % len(chars)
-                for idx, char in enumerate(chars):
-                    dur = char_dur + (1 if idx < remainder else 0)
-                    k_text += f"{{\\k{dur}}}{char}"
-                k_text += " "
+                raw_word = word.word or ""
+                if not raw_word:
+                    continue
 
-            # Coordenadas: Zona Central Compacta (Smooth Action Zone)
-            y_in, y_out = 580, 120
-            scroll_move = f"\\move(640,{y_in},640,{y_out})"
+                w_start = word.start if word.start is not None else s_start
+                w_end = word.end if word.end is not None else w_start
+                if w_end <= w_start:
+                    continue
+
+                total_word_cs = max(1, int(round((w_end - w_start) * 100)))
+                syllable_chunks = split_token_into_syllables(raw_word)
+                if total_word_cs < len(syllable_chunks):
+                    syllable_chunks = [raw_word]
+                if not syllable_chunks:
+                    syllable_chunks = [raw_word]
+
+                weights = [max(1, len(LETTER_PATTERN.findall(chunk))) for chunk in syllable_chunks]
+                weight_sum = sum(weights) if weights else 1
+                syllable_cs = [(total_word_cs * w) // weight_sum for w in weights]
+                remainder_cs = total_word_cs - sum(syllable_cs)
+                for r in range(remainder_cs):
+                    syllable_cs[r % len(syllable_cs)] += 1
+
+                chunk_start = w_start
+                for s_idx, (chunk, chunk_cs) in enumerate(zip(syllable_chunks, syllable_cs)):
+                    chunk_cs = max(1, chunk_cs)
+                    chunk_end = w_end if s_idx == len(syllable_chunks) - 1 else min(w_end, chunk_start + (chunk_cs / 100.0))
+
+                    chunk_width = get_text_width(chunk, size=48)
+                    width_before = get_text_width(cumulative_text, size=48)
+                    center_x_offset = width_before + (chunk_width / 2)
+
+                    syllable_data.append({
+                        'start': chunk_start,
+                        'end': chunk_end,
+                        'x': center_x_offset,
+                        'dur': max(0.01, chunk_end - chunk_start)
+                    })
+                    k_text += f"{{\\k{chunk_cs}}}{chunk}"
+                    cumulative_text += chunk
+                    chunk_start = chunk_end
+
+            # Escribir línea de texto
+            f.write(f"Dialogue: 1,{format_timestamp(v_start)},{format_timestamp(v_end)},Active,,0,0,0,,{{\\pos(640,{y_pos})}}{k_text.strip()}\n")
             
-            fade = "\\fad(800,500)"
+            # --- PELOTA: REBOTE VERTICAL TIPO PING-PONG POR SÍLABA ---
+            total_seg_width = get_text_width(cumulative_text, size=48)
+            start_x = 640 - (total_seg_width / 2)
+            bottom_y = y_pos - 45
+            top_y = y_pos - 105
+            current_y = bottom_y
             
-            t_sing_start = int((s_start - v_start) * 1000)
-            t_sing_end = int((s_end - v_start) * 1000)
-            zoom = f"\\t({t_sing_start},{t_sing_end},\\fscx115\\fscy115)"
-            
-            effect_tags = f"{{{scroll_move}{fade}{zoom}}}"
-            f.write(f"Dialogue: 0,{format_timestamp(v_start)},{format_timestamp(v_end)},Active,,0,0,0,,{effect_tags}{k_text.strip()}\n")
-            
+            for idx, s in enumerate(syllable_data):
+                abs_x = start_x + s['x']
+                s_start = s['start']
+                s_end = s['end']
+                if s_end <= s_start:
+                    continue
+
+                target_y = top_y if (idx % 2 == 0) else bottom_y
+
+                if idx == 0:
+                    prep_start = max(v_start, s_start - 0.25)
+                    f.write(f"Dialogue: 2,{format_timestamp(prep_start)},{format_timestamp(s_start)},Ball,,0,0,0,,{{\\an5\\pos({abs_x},{current_y})\\fscx0\\fscy0\\t(\\fscx100\\fscy100)}}●\\n")
+
+                # Rebote vertical por sílaba (la duración real define la velocidad)
+                f.write(f"Dialogue: 2,{format_timestamp(s_start)},{format_timestamp(s_end)},Ball,,0,0,0,,{{\\an5\\move({abs_x},{current_y},{abs_x},{target_y})\\fscx120\\fscy120}}●\\n")
+                current_y = target_y
+
+                # Desplazamiento horizontal entre sílabas sin cambiar altura
+                if idx < len(syllable_data) - 1:
+                    next_s = syllable_data[idx + 1]
+                    next_x = start_x + next_s['x']
+                    if next_s['start'] > s_end:
+                        f.write(f"Dialogue: 2,{format_timestamp(s_end)},{format_timestamp(next_s['start'])},Ball,,0,0,0,,{{\\an5\\move({abs_x},{current_y},{next_x},{current_y})}}●\\n")
+                else:
+                    fade_end = min(v_end, s_end + 0.25)
+                    f.write(f"Dialogue: 2,{format_timestamp(s_end)},{format_timestamp(fade_end)},Ball,,0,0,0,,{{\\an5\\pos({abs_x},{current_y})\\t(\\fscx0\\fscy0)}}●\\n")
+
         f.flush()
         os.fsync(f.fileno())
     return True
@@ -283,7 +443,6 @@ def main():
             download_media(args.url, audio_wav, video_mp4, quality_height=args.quality)
             separate_lead_vocals(audio_wav, inst_wav, voc_wav, "temp")
             
-            # Buscar letra en Genius si no se provee por argumento
             if args.lyrics and os.path.exists(args.lyrics):
                 with open(args.lyrics, 'r', encoding='utf-8') as f:
                     lyrics_content = f.read().strip()
